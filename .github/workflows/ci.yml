@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cxx: g++
+          - os: macos-latest
+            cxx: clang++
+    runs-on: ${{ matrix.os }}
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j 4
+      - name: unit + e2e tests
+        run: ./build/matchbox_tests
+      - name: engine benchmark (smoke)
+        run: ./build/matchbox_bench --orders 200000
+      - name: replay CSV over TCP
+        run: |
+          ./build/matchbox_server --port 9001 --md-port 9002 & SRV=$!
+          sleep 1
+          python3 scripts/replay.py scripts/sample_orders.csv --port 9001
+          ./build/matchbox_client load --port 9001 --orders 20000 --inflight 16
+          kill -INT $SRV
+          wait $SRV
+
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure (ASan + UBSan)
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMATCHBOX_ASAN=ON
+      - name: build
+        run: cmake --build build-asan -j 4
+      - name: tests
+        run: ./build-asan/matchbox_tests
