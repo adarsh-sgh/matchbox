@@ -1,0 +1,11 @@
+action,tag,symbol,side,type,tif,price,qty
+new,1,0,buy,limit,gtc,10000,100
+new,2,0,buy,limit,gtc,9999,50
+new,3,0,sell,limit,gtc,10002,80
+new,4,0,sell,limit,gtc,10000,30
+new,5,0,sell,limit,ioc,9995,200
+new,6,0,buy,market,gtc,,20
+replace,3,,,,,10001,40
+cancel,3,,,,,,
+cancel,3,,,,,,
+new,7,0,buy,limit,gtc,0,10
