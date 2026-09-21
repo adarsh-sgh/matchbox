@@ -34,7 +34,9 @@ bool read_frame(int fd, Frame& f) {
 
 Frame next(int fd) {
   Frame f;
-  REQUIRE(read_frame(fd, f));
+  do {
+    REQUIRE(read_frame(fd, f));
+  } while (f.type == wire::MsgType::Heartbeat);  // idle-stream keepalives are timing dependent
   return f;
 }
 
@@ -65,7 +67,8 @@ TEST_CASE("e2e: two clients trade over TCP, market data fans out, bad seq discon
   REQUIRE(md >= 0);
   REQUIRE(c1 >= 0);
   REQUIRE(c2 >= 0);
-  // Give the gateway a moment to register the subscriber before the first trade.
+  // Subscribe live and give the gateway a moment to see it before the first trade.
+  send(md, wire::make<wire::Subscribe>());
   usleep(20000);
 
   auto n1 = wire::make<wire::NewOrder>(1);
@@ -137,9 +140,27 @@ TEST_CASE("e2e: two clients trade over TCP, market data fans out, bad seq discon
   Frame eof;
   CHECK_FALSE(read_frame(c1, eof));
 
+  // Subscriber drops, misses the cancel's Top update, and resumes from where it stopped.
+  ::close(md);
+  auto cx2 = wire::make<wire::CancelOrder>(3);
+  cx2.tag = 55;
+  cx2.order_id = bid_id;
+  send(c2, cx2);  // c2 cancelling c1's order: reject, no market data
+  CHECK(next(c2).as<wire::Reject>().reason == static_cast<uint8_t>(RejectReason::NotOwner));
+  usleep(20000);
+  const int md2 = connect_tcp("127.0.0.1", server.md_port());
+  REQUIRE(md2 >= 0);
+  auto sub = wire::make<wire::Subscribe>();
+  sub.from_seq = 3;  // already saw 1..3 (top, trade, top); 4 was the replace's top
+  send(md2, sub);
+  CHECK(next(md2).as<wire::Top>().hdr.seq == 3);
+  const auto top4 = next(md2).as<wire::Top>();
+  CHECK(top4.hdr.seq == 4);
+  CHECK(top4.bid_qty == 10);
+  ::close(md2);
+
   ::close(c1);
   ::close(c2);
-  ::close(md);
   stop.store(true);
   net.join();
   engine.stop();

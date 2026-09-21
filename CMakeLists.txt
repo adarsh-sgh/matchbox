@@ -42,6 +42,7 @@ add_executable(matchbox_tests
   tests/test_engine.cpp
   tests/test_protocol.cpp
   tests/test_spsc.cpp
-  tests/test_e2e.cpp)
+  tests/test_e2e.cpp
+  tests/test_stream.cpp)
 target_link_libraries(matchbox_tests PRIVATE matchbox)
 add_test(NAME matchbox_tests COMMAND matchbox_tests)

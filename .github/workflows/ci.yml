@@ -33,7 +33,12 @@ jobs:
           ./build/matchbox_server --port 9001 --md-port 9002 & SRV=$!
           sleep 1
           python3 scripts/replay.py scripts/sample_orders.csv --port 9001
+          python3 scripts/mdstream.py --port 9002 --seconds 4 --quiet --expect-no-loss & MD=$!
+          ./build/matchbox_client md --port 9002 --stats --seconds 4 & MDC=$!
+          sleep 0.5
           ./build/matchbox_client load --port 9001 --orders 20000 --inflight 16
+          wait $MD
+          wait $MDC
           kill -INT $SRV
           wait $SRV
 
