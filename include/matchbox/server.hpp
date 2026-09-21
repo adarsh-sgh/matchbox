@@ -27,7 +27,8 @@ class Server {
   struct Config {
     uint16_t port = 9001;
     uint16_t md_port = 9002;
-    size_t max_backlog = 8u << 20;
+    size_t max_backlog = 8u << 20;  // per order session
+    Publisher::Config md;           // market-data stream
   };
 
   Server(Config cfg, SpscQueue<Command>& to_engine, SpscQueue<Event>& from_engine);

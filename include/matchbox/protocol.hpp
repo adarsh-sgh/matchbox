@@ -5,8 +5,12 @@
 #include <vector>
 
 // Wire protocol: fixed-size packed little-endian frames. Every frame starts
-// with a Header; `len` is the total frame size, `seq` is per-direction and
-// per-connection, starting at 1 and incrementing by one per frame.
+// with a Header; `len` is the total frame size. On the order port `seq` is
+// per-direction and per-connection, starting at 1 and incrementing by one per
+// frame. On the market-data port `seq` of a Trade/Top frame is the global
+// stream sequence (gap-free, shared by every subscriber) so a client can
+// detect loss and resume from where it stopped; control frames (Heartbeat,
+// Gap) carry seq 0.
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "matchbox wire protocol assumes a little-endian host"
@@ -21,6 +25,8 @@ enum class MsgType : uint8_t {
   NewOrder = 1,
   CancelOrder = 2,
   ReplaceOrder = 3,
+  // client -> market-data port
+  Subscribe = 4,
   // gateway -> client
   Ack = 16,
   Reject = 17,
@@ -30,6 +36,8 @@ enum class MsgType : uint8_t {
   // market data
   Trade = 32,
   Top = 33,
+  Heartbeat = 34,
+  Gap = 35,
 };
 
 #pragma pack(push, 1)
@@ -69,6 +77,15 @@ struct ReplaceOrder {
   int64_t price;
   uint32_t qty;  // new remaining quantity
   uint32_t pad;
+};
+
+// First frame a market-data client sends. from_seq 0 means "live from now";
+// otherwise the stream resumes at from_seq if the gateway still holds it,
+// else at the oldest retained frame after a Gap.
+struct Subscribe {
+  static constexpr MsgType kType = MsgType::Subscribe;
+  Header hdr;
+  uint64_t from_seq;
 };
 
 struct Ack {
@@ -136,6 +153,25 @@ struct Top {
   uint32_t bid_qty;
   uint32_t ask_qty;
 };
+
+// Sent on an idle stream every heartbeat interval; head_seq is the newest
+// stream sequence so a client can tell "quiet" from "stalled".
+struct Heartbeat {
+  static constexpr MsgType kType = MsgType::Heartbeat;
+  Header hdr;
+  uint64_t ts_ns;
+  uint64_t head_seq;
+};
+
+// Frames [from, resumed_at) are gone: either the client resumed from a
+// sequence the replay ring no longer holds, or it read too slowly and the
+// ring lapped its cursor. The stream continues from resumed_at.
+struct Gap {
+  static constexpr MsgType kType = MsgType::Gap;
+  Header hdr;
+  uint64_t from;
+  uint64_t resumed_at;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(Header) == 8, "header layout");
@@ -149,6 +185,9 @@ static_assert(sizeof(Cancelled) == 24, "Cancelled layout");
 static_assert(sizeof(Replaced) == 32, "Replaced layout");
 static_assert(sizeof(Trade) == 40, "Trade layout");
 static_assert(sizeof(Top) == 40, "Top layout");
+static_assert(sizeof(Subscribe) == 16, "Subscribe layout");
+static_assert(sizeof(Heartbeat) == 24, "Heartbeat layout");
+static_assert(sizeof(Gap) == 24, "Gap layout");
 
 constexpr size_t kMaxFrame = 64;
 
@@ -164,6 +203,9 @@ inline size_t size_for(MsgType t) {
     case MsgType::Replaced: return sizeof(Replaced);
     case MsgType::Trade: return sizeof(Trade);
     case MsgType::Top: return sizeof(Top);
+    case MsgType::Subscribe: return sizeof(Subscribe);
+    case MsgType::Heartbeat: return sizeof(Heartbeat);
+    case MsgType::Gap: return sizeof(Gap);
   }
   return 0;
 }

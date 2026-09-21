@@ -1,5 +1,7 @@
 #include "matchbox/server.hpp"
 
+#include "matchbox/clock.hpp"
+
 #include <cerrno>
 #include <csignal>
 #include <stdexcept>
@@ -9,7 +11,7 @@
 namespace matchbox {
 
 Server::Server(Config cfg, SpscQueue<Command>& to_engine, SpscQueue<Event>& from_engine)
-    : cfg_(cfg), to_engine_(to_engine), from_engine_(from_engine), publisher_(poller_, cfg.max_backlog) {
+    : cfg_(cfg), to_engine_(to_engine), from_engine_(from_engine), publisher_(poller_, cfg.md) {
   ::signal(SIGPIPE, SIG_IGN);
   listen_fd_ = listen_tcp(cfg.port, &port_);
   md_listen_fd_ = listen_tcp(cfg.md_port, &md_port_);
@@ -77,7 +79,7 @@ void Server::run(const std::atomic<bool>& stop) {
     }
     const bool worked = drain_engine();
     flush_dirty();
-    publisher_.flush_all();
+    publisher_.flush_all(now_ns());
     idle = (n > 0 || worked) ? 0 : idle + 1;
   }
 }
