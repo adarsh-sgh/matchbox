@@ -1,7 +1,10 @@
 // Load generator (`load`) and market-data tap (`md`) for a running matchbox_server.
+#include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <random>
+#include <sys/select.h>
 #include <unistd.h>
 #include <vector>
 
@@ -108,34 +111,129 @@ int run_load(const Args& args) {
   return 0;
 }
 
+// Resumable market-data subscriber. Tracks the stream sequence, counts gaps
+// (explicit Gap frames and any seq jump), treats a missed heartbeat as a dead
+// link and reconnects from the last seq seen. With --stats it prints a
+// fan-out latency histogram (engine trade timestamp -> client receive) instead
+// of every frame.
 int run_md(const Args& args) {
   const std::string host = args.str("host", "127.0.0.1");
   const auto port = static_cast<uint16_t>(args.num("port", 9002));
-  const int fd = connect_tcp(host.c_str(), port);
-  if (fd < 0) {
-    std::perror("connect");
-    return 1;
-  }
+  const bool stats = args.has("stats");
+  const double seconds = args.real("seconds", 0);  // 0 = until EOF / Ctrl-C
+  const long slow_us = args.num("slow-us", 0);     // sleep per read to act as a slow consumer
+  const auto hb_timeout_ns = static_cast<uint64_t>(args.num("heartbeat-timeout-ms", 3000)) * 1000000;
+  const bool reconnect = !args.has("no-reconnect");
+
+  uint64_t from = static_cast<uint64_t>(args.num("from", 0));
+  uint32_t last_seq = 0;
+  uint64_t frames = 0, gaps = 0, lost = 0, heartbeats = 0, reconnects = 0;
+  std::vector<uint64_t> fanout_ns;
   std::vector<uint8_t> rx;
   uint8_t buf[1 << 16];
-  for (;;) {
-    const ssize_t n = ::read(fd, buf, sizeof buf);
-    if (n <= 0) break;
-    rx.insert(rx.end(), buf, buf + n);
-    for_each_frame(rx, [&](wire::MsgType t, const uint8_t* p) {
-      if (t == wire::MsgType::Trade) {
-        const auto m = wire::read<wire::Trade>(p);
-        std::printf("TRADE sym=%u %s %u @ %lld\n", m.symbol, m.aggressor ? "sell" : "buy", m.qty,
-                    static_cast<long long>(m.price));
-      } else if (t == wire::MsgType::Top) {
-        const auto m = wire::read<wire::Top>(p);
-        std::printf("TOP   sym=%u bid %u @ %lld | ask %u @ %lld\n", m.symbol, m.bid_qty,
-                    static_cast<long long>(m.bid), m.ask_qty, static_cast<long long>(m.ask));
+  const uint64_t t_start = now_ns();
+  const uint64_t t_end = seconds > 0 ? t_start + static_cast<uint64_t>(seconds * 1e9) : UINT64_MAX;
+  unsigned backoff_ms = 50;
+
+  while (now_ns() < t_end) {
+    const int fd = connect_tcp(host.c_str(), port);
+    if (fd < 0) {
+      if (!reconnect) {
+        std::perror("connect");
+        return 1;
       }
-    });
-    std::fflush(stdout);
+      ::usleep(backoff_ms * 1000);
+      backoff_ms = std::min(backoff_ms * 2, 2000u);
+      continue;
+    }
+    auto sub = wire::make<wire::Subscribe>();
+    sub.from_seq = from;
+    if (!write_full(fd, &sub, sizeof sub)) {
+      ::close(fd);
+      continue;
+    }
+    if (!stats) std::printf("subscribed from seq %llu\n", static_cast<unsigned long long>(from));
+    backoff_ms = 50;
+    rx.clear();
+    uint64_t last_rx_ns = now_ns();
+    bool alive = true;
+    while (alive && now_ns() < t_end) {
+      timeval tv{};
+      tv.tv_sec = 0;
+      tv.tv_usec = 100000;
+      fd_set rfds;
+      FD_ZERO(&rfds);
+      FD_SET(fd, &rfds);
+      const int r = ::select(fd + 1, &rfds, nullptr, nullptr, &tv);
+      if (r < 0 && errno == EINTR) continue;
+      if (r == 0) {
+        if (now_ns() - last_rx_ns > hb_timeout_ns) {
+          if (!stats) std::printf("no heartbeat for %llums, reconnecting\n", static_cast<unsigned long long>(hb_timeout_ns / 1000000));
+          alive = false;
+        }
+        continue;
+      }
+      if (slow_us > 0) ::usleep(static_cast<useconds_t>(slow_us));
+      const ssize_t n = ::read(fd, buf, sizeof buf);
+      if (n <= 0) {
+        alive = false;
+        break;
+      }
+      const uint64_t now = now_ns();
+      last_rx_ns = now;
+      rx.insert(rx.end(), buf, buf + n);
+      for_each_frame(rx, [&](wire::MsgType t, const uint8_t* p) {
+        const wire::Header h = wire::read_header(p);
+        if (t == wire::MsgType::Heartbeat) {
+          const auto hb = wire::read<wire::Heartbeat>(p);
+          ++heartbeats;
+          last_seq = std::max<uint32_t>(last_seq, static_cast<uint32_t>(hb.head_seq));  // resume point on a quiet stream
+          return;
+        }
+        if (t == wire::MsgType::Gap) {
+          const auto g = wire::read<wire::Gap>(p);
+          ++gaps;
+          lost += g.resumed_at - g.from;
+          last_seq = static_cast<uint32_t>(g.resumed_at - 1);
+          if (!stats)
+            std::printf("GAP   frames %llu..%llu lost\n", static_cast<unsigned long long>(g.from),
+                        static_cast<unsigned long long>(g.resumed_at - 1));
+          return;
+        }
+        if (last_seq != 0 && h.seq != last_seq + 1) {  // should never happen: Gap covers ring laps
+          ++gaps;
+          lost += h.seq - last_seq - 1;
+          if (!stats) std::printf("SEQ JUMP %u -> %u\n", last_seq, h.seq);
+        }
+        last_seq = h.seq;
+        ++frames;
+        if (t == wire::MsgType::Trade) {
+          const auto m = wire::read<wire::Trade>(p);
+          if (stats) {
+            fanout_ns.push_back(now > m.ts_ns ? now - m.ts_ns : 0);
+          } else {
+            std::printf("[%u] TRADE sym=%u %s %u @ %lld\n", h.seq, m.symbol, m.aggressor ? "sell" : "buy", m.qty,
+                        static_cast<long long>(m.price));
+          }
+        } else if (t == wire::MsgType::Top && !stats) {
+          const auto m = wire::read<wire::Top>(p);
+          std::printf("[%u] TOP   sym=%u bid %u @ %lld | ask %u @ %lld\n", h.seq, m.symbol, m.bid_qty,
+                      static_cast<long long>(m.bid), m.ask_qty, static_cast<long long>(m.ask));
+        }
+      });
+      if (!stats) std::fflush(stdout);
+    }
+    ::close(fd);
+    if (!reconnect || now_ns() >= t_end) break;
+    ++reconnects;
+    from = last_seq + 1;
   }
-  ::close(fd);
+  const double secs = static_cast<double>(now_ns() - t_start) / 1e9;
+  std::printf("md: %llu frames in %.2fs (%.0f frames/s), gaps %llu (%llu frames lost), heartbeats %llu, reconnects %llu, last seq %u\n",
+              static_cast<unsigned long long>(frames), secs, frames / secs, static_cast<unsigned long long>(gaps),
+              static_cast<unsigned long long>(lost), static_cast<unsigned long long>(heartbeats),
+              static_cast<unsigned long long>(reconnects), last_seq);
+  if (!fanout_ns.empty()) print_latency("trade fan-out (engine ts -> client rx)", fanout_ns, 1000.0, "us");
   return 0;
 }
 
@@ -151,6 +249,7 @@ int main(int argc, char** argv) {
   std::printf(
       "usage: matchbox_client load [--host 127.0.0.1] [--port 9001] [--orders 100000] [--inflight 1]\n"
       "                            [--symbol 0] [--mid 10000] [--spread 5]\n"
-      "       matchbox_client md   [--host 127.0.0.1] [--port 9002]\n");
+      "       matchbox_client md   [--host 127.0.0.1] [--port 9002] [--from 0] [--stats] [--seconds 0]\n"
+      "                            [--slow-us 0] [--heartbeat-timeout-ms 3000] [--no-reconnect]\n");
   return mode.empty() ? 0 : 1;
 }
